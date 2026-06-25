@@ -1,0 +1,7 @@
+# build scratch: cloned upstream repos + downloaded checkpoints (never commit)
+.build/
+
+# notebook / runtime outputs
+output/
+.ipynb_checkpoints/
+__pycache__/
