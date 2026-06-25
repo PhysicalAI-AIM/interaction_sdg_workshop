@@ -26,13 +26,21 @@ FROM ${BASE_IMAGE}
 
 WORKDIR /workspace/robotsmith
 
-# RoboSmith parts the base runtime image does not bake (scenarios + demo assets).
+# RoboSmith parts pinned to the workshop upstream ref (scenarios + demo assets +
+# scripts the notebook drives). Overlaying scripts also keeps the checkpoint
+# converter in lockstep with this ref instead of whatever the base baked.
 COPY --from=robosmith scenarios ./scenarios
 COPY --from=robosmith assets ./assets
+COPY --from=robosmith scripts ./scripts
 
 # GraspGen source (on PYTHONPATH; deps already in base) + official checkpoints.
+# Only the Franka Panda weights are baked — not the unused (and likewise
+# research-licensed) robotiq / suction checkpoints.
 COPY --from=graspgen . /workspace/GraspGen
-COPY --from=graspgenmodels . /workspace/GraspGenModels
+COPY --from=graspgenmodels checkpoints/graspgen_franka_panda_gen.pth \
+     checkpoints/graspgen_franka_panda_dis.pth \
+     checkpoints/graspgen_franka_panda.yml \
+     /workspace/GraspGenModels/checkpoints/
 
 # Convert the Franka gen+dis checkpoints to the spconv_rocm 3D weight layout.
 # graspgen_wrapper.py auto-prefers the *_rocm.pth siblings when present, so the
