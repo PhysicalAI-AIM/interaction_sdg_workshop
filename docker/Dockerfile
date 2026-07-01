@@ -53,7 +53,8 @@ RUN python scripts/setup/_convert_spconv_ckpt.py \
 # (scenarios/, scripts/, workshop/videos/, output/) all resolve from the kernel
 # cwd = /workspace/robotsmith.
 COPY workshop_cdna3.ipynb ./workshop_cdna3.ipynb
-COPY videos/rocrobo_compare.mp4 ./workshop/videos/rocrobo_compare.mp4
+COPY --from=rocrobo rocRobo/samples/media/demo_compare.mp4 \
+     ./workshop/videos/rocrobo_compare.mp4
 
 # Jupyter (not a base dep) + docker CLI so the notebook can `docker exec` the
 # rocRobo sidecar without mounting the host docker binary.

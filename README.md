@@ -19,7 +19,7 @@ vendored or hard-coded to a local path, so the images deploy cleanly to the clou
 | Dependency | Source | License | Baked by |
 |---|---|---|---|
 | RoboSmith (SDG engine, CAP, scenarios, assets) | `github.com/ZJLi2013/RoboSmith` | open | base + workshop image |
-| rocRobo (collision-free motion) | `github.com/ZJLi2013/rocRobo` | open | sidecar image |
+| rocRobo (collision-free motion) | `github.com/ZJLi2013/rocRobo` | open | sidecar image **or** all-inone image |
 | spconv_rocm (ROCm sparse-conv for GraspGen) | `github.com/ZJLi2013/spconv_rocm` | open | base image |
 | Genesis 0.4.5 (pinned), LeRobot 0.4.4 | PyPI / GitHub | open | base image |
 | Base runtime | `rocm/pytorch:rocm6.4.3_…_pytorch_2.6.0` | open | base image |
@@ -45,16 +45,68 @@ interaction_sdg_workshop/
 ├── workshop_cdna3.ipynb       ← the live notebook (gen-only)
 ├── docker/
 │   ├── Dockerfile             ← RoboSmith workshop image (FROM base; bakes repo+GraspGen+ckpt)
-│   └── Dockerfile.rocrobo     ← rocRobo motion sidecar image (bakes rocRobo source)
+│   ├── Dockerfile.allinone    ← ★ single-image deploy (no docker.sock / sidecar)
+│   ├── Dockerfile.rocrobo     ← rocRobo motion sidecar image (bakes rocRobo source)
+│   ├── rocrobo-serve-local.sh ← all-in-one: spawn warm serve subprocess
+│   └── patches/rocrobo_backend.py
 ├── scripts/
-│   └── build.sh               ← clones all upstream + builds the 3 images
+│   ├── build.sh               ← clones all upstream + builds the 3 images
+│   └── build-allinone.sh      ← ★ builds one self-contained image
 ├── videos/rocrobo_compare.mp4 ← collision-blind vs -aware clip (notebook §4)
 └── images/                    ← inspection fallbacks
 ```
 
 ---
 
-## Teacher / Admin Setup
+## All-in-one deploy (recommended for MLOps)
+
+For platforms that should not mount `docker.sock` (K8S, managed notebook, batch
+Job), use the **single-image** path. RoboSmith (torch) and rocRobo (jax) still
+run as **separate processes** inside one container — only the orchestration
+changes (`ROCROBO_LAUNCH=local` subprocess instead of `docker exec`).
+
+```bash
+bash scripts/build-allinone.sh
+```
+
+Produces one image: `robotsmith:workshop-gfx942-allinone`
+
+```bash
+docker rm -f workshop_allinone 2>/dev/null || true
+docker run -d --name workshop_allinone -p 8888:8888 \
+  --device=/dev/kfd --device=/dev/dri --group-add video \
+  --security-opt seccomp=unconfined --ipc=host --shm-size=24g \
+  -e HIP_VISIBLE_DEVICES=0 \
+  robotsmith:workshop-gfx942-allinone
+```
+
+Baked in: RoboSmith scenarios/assets/scripts, GraspGen + checkpoints, rocRobo
+source, bundled JAX python prefix (`/opt/rocrobo`), notebook, compare video.
+**No runtime mounts** (GPU devices only).
+
+### Autoloop validation
+
+After build, run the full smoke + datagen suite:
+
+```bash
+bash scripts/autoloop.sh 2>&1 | tee .build/autoloop.log
+# status summary: .build/AUTOLOOP_STATUS.md
+```
+
+| | Two-container (`build.sh`) | All-in-one (`build-allinone.sh`) |
+|---|---|---|
+| Images | 3 (base + workshop + sidecar) | 2 (base + allinone) |
+| `docker.sock` | required | **not needed** |
+| rocRobo launch | `docker exec` sidecar | local subprocess |
+| Image size | smaller per image | larger (~+jax stack) |
+
+> The all-in-one image copies a ROCm 7.2 JAX prefix to `/opt/rocm-jax` and only
+> exposes it to the rocRobo serve subprocess, so torch keeps the gfx942-pinned
+> ROCm 6.4 stack. Validate on target MI300/MI325 hardware before production rollout.
+
+---
+
+## Teacher / Admin Setup (two-container workshop)
 
 Prereqs on a `gfx942` node: `docker` (BuildKit), `git`, `git-lfs`, internet.
 
