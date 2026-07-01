@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1.7
+#
+# All-in-one Interaction-Ready SDG workshop image (CDNA3 / gfx942).
+#
+# Single image, single container — no docker.sock, no sidecar container.
+# RoboSmith (torch / ROCm 6.4) and rocRobo (jax / ROCm 7.2) run as separate
+# processes in the same pod; the torch process spawns a warm rocrobo.serve via
+# ROCROBO_LAUNCH=local (see docker/rocrobo-serve-local.sh).
+#
+# Build contexts (filled by scripts/build-allinone.sh):
+#   robosmith       -> github.com/ZJLi2013/RoboSmith
+#   rocrobo         -> github.com/ZJLi2013/rocRobo
+#   graspgen        -> github.com/NVlabs/GraspGen            (NVIDIA research/eval)
+#   graspgenmodels  -> hf.co/adithyamurali/GraspGenModels    (NVIDIA research/eval)
+#
+#   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.allinone \
+#     -t robotsmith:workshop-gfx942-allinone \
+#     --build-arg BASE_IMAGE=robotsmith:gfx942-rocm6.4.3-genesis0.4.5 \
+#     --build-context robosmith=<RoboSmith clone> \
+#     --build-context rocrobo=<rocRobo clone> \
+#     --build-context graspgen=<GraspGen clone> \
+#     --build-context graspgenmodels=<GraspGenModels clone> .
+
+ARG ROCROBO_BASE=rocm/jax:rocm7.2.4-jax0.8.2-py3.12
+ARG BASE_IMAGE=robotsmith:gfx942-rocm6.4.3-genesis0.4.5
+
+# -----------------------------------------------------------------------------
+# Stage A — rocRobo JAX stack (ROCm 7.2 + jax 0.8.2)
+# -----------------------------------------------------------------------------
+FROM ${ROCROBO_BASE} AS rocrobo-stack
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /rocrobo
+COPY --from=rocrobo . /rocrobo
+ENV PYTHONPATH=/rocrobo/pyroki/src:/rocrobo/rocRobo/core:/usr/local/lib/python3.12/dist-packages
+RUN pip install --no-cache-dir -e /rocrobo/pyroki \
+    && python3.12 -c "from robot_descriptions.loaders.yourdfpy import load_robot_description; load_robot_description('panda_description'); print('urdf_cache_ok')"
+
+# -----------------------------------------------------------------------------
+# Stage B — RoboSmith workshop layers (torch / ROCm 6.4 + Genesis 0.4.5)
+# -----------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS workshop
+
+WORKDIR /workspace/robotsmith
+
+COPY --from=robosmith scenarios ./scenarios
+COPY --from=robosmith assets ./assets
+COPY --from=robosmith scripts ./scripts
+
+COPY --from=graspgen . /workspace/GraspGen
+COPY --from=graspgenmodels checkpoints/graspgen_franka_panda_gen.pth \
+     checkpoints/graspgen_franka_panda_dis.pth \
+     checkpoints/graspgen_franka_panda.yml \
+     /workspace/GraspGenModels/checkpoints/
+
+RUN python scripts/setup/_convert_spconv_ckpt.py \
+      /workspace/GraspGenModels/checkpoints/graspgen_franka_panda_gen.pth \
+      /workspace/GraspGenModels/checkpoints/graspgen_franka_panda_dis.pth
+
+COPY workshop_cdna3.ipynb ./workshop_cdna3.ipynb
+COPY workshop_cdna3_en.ipynb ./workshop_cdna3_en.ipynb
+COPY --from=rocrobo rocRobo/samples/media/demo_compare.mp4 \
+     ./workshop/videos/rocrobo_compare.mp4
+
+RUN python -m pip install --no-cache-dir notebook ipykernel
+
+# -----------------------------------------------------------------------------
+# Stage C — merge: workshop + bundled rocRobo JAX runtime
+# -----------------------------------------------------------------------------
+FROM workshop AS allinone
+
+# rocRobo source (serve module + pyroki editable install metadata).
+COPY --from=rocrobo-stack /rocrobo /rocrobo
+
+# Bundled JAX stack for the serve subprocess (torch keeps conda python + ROCm 6.4).
+COPY --from=rocrobo-stack /usr/local/lib/python3.12/dist-packages \
+     /opt/rocrobo/lib/python3.12/dist-packages
+COPY --from=rocrobo-stack /opt/rocm-7.2.4 /opt/rocm-jax
+COPY --from=rocrobo-stack /root/.cache/robot_descriptions /root/.cache/robot_descriptions
+
+COPY docker/rocrobo-serve-local.sh /usr/local/bin/rocrobo-serve-local
+RUN chmod +x /usr/local/bin/rocrobo-serve-local
+
+# Workshop patch: local subprocess launch instead of docker exec.
+COPY docker/patches/rocrobo_backend.py \
+     /workspace/robotsmith/robotsmith/motion/rocrobo_backend.py
+
+ENV PYTHONPATH=/workspace/GraspGen:/workspace/robotsmith \
+    GRASPGEN_CONFIG=/workspace/GraspGenModels/checkpoints/graspgen_franka_panda.yml \
+    ROCROBO_BACKEND=1 \
+    ROCROBO_LAUNCH=local \
+    ROCROBO_WORKDIR=/rocrobo \
+    ROCROBO_PYTHONPATH=/rocrobo/rocRobo/core \
+    ROCROBO_ASSETS=/rocrobo/pyroki/examples/assets \
+    ROCROBO_PYTHON=/usr/bin/python3.12 \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    AMD_COMGR_NAMESPACE=1
+
+EXPOSE 8888
+
+# ENTRYPOINT robotsmith-headless (xvfb + HSA_OVERRIDE_GFX_VERSION) from base.
+CMD ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", \
+     "--allow-root", "--notebook-dir=/workspace/robotsmith"]

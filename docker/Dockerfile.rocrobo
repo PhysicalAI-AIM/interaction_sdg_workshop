@@ -11,14 +11,14 @@
 # Build (driven by scripts/build.sh; build context = the rocRobo clone):
 #   DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile.rocrobo \
 #     -t rocrobo:workshop-gfx942 <rocRobo clone>
-ARG BASE_IMAGE=rocrobo/pyroki:rocm7.2.4-jax0.8.2
+ARG BASE_IMAGE=rocm/jax:rocm7.2.4-jax0.8.2-py3.12
 FROM ${BASE_IMAGE}
 
 WORKDIR /rocrobo
 COPY . /rocrobo
 
 # deps already in the base image; install the package only (editable).
-RUN pip install -e /rocrobo/pyroki --no-deps
+RUN pip install -e /rocrobo/pyroki
 
 ENV ROCROBO_PYTHONPATH=/rocrobo/rocRobo/core \
     ROCROBO_ASSETS=/rocrobo/pyroki/examples/assets
