@@ -13,6 +13,18 @@ export AMD_COMGR_NAMESPACE="${AMD_COMGR_NAMESPACE:-1}"
 WORKDIR="${ROCROBO_WORKDIR:-/rocrobo}"
 cd "$WORKDIR"
 
+# Persist XLA compiled executables to disk so the multi-minute first-call JIT is
+# paid ONCE *ever* (not per fresh serve / per scenario run). Each scenario run
+# spawns a new serve, so without this every run recompiles from scratch — the
+# original workshop slowdown / motion-planning timeouts. MIN_*=0 caches even
+# quick/small compiles so the warm cache is never partial. Cache lives in the
+# container's writable layer (no bind mount in the all-in-one image), which is
+# enough to amortise across the serves within a single container run.
+export JAX_COMPILATION_CACHE_DIR="${ROCROBO_JAX_CACHE:-$WORKDIR/.jax_cache}"
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS="${JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS:-0}"
+export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES="${JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES:-0}"
+mkdir -p "$JAX_COMPILATION_CACHE_DIR" || true
+
 PY="${ROCROBO_PYTHON:-/usr/bin/python3.12}"
 if [ ! -x "$PY" ]; then
   echo "rocrobo-serve-local: python not found at $PY" >&2

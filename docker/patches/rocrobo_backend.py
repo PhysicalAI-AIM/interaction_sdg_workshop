@@ -7,10 +7,18 @@ generation never blocks. The ``world`` / ``attach`` payloads it sends are built
 by the authoring layer in ``rocrobo_world.py`` and passed into ``solve_ik`` /
 ``plan_motion`` by the caller — this module does not construct them.
 
+This is the workshop variant of the upstream RoboSmith backend. It is kept in
+lock-step with ``robotsmith/motion/rocrobo_backend.py`` upstream (bounded
+``select`` read, stuck-serve teardown, and — critically — the JAX persistent
+compilation cache) and adds a second launch mode for the all-in-one image.
+
 Deployment modes (``ROCROBO_LAUNCH``):
   docker (default): ``docker exec -i <container> python -m rocrobo.serve --serve``
+                    (two-container deploy; needs docker.sock).
   local:            ``/usr/local/bin/rocrobo-serve-local`` subprocess in the
-                    same container (all-in-one workshop image).
+                    same container (all-in-one workshop image, no docker.sock).
+                    The wrapper exports the JAX compile-cache env vars, so both
+                    modes amortise the multi-minute XLA JIT across scenario runs.
 """
 
 from __future__ import annotations
@@ -18,9 +26,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import subprocess
 import threading
-import time
 from typing import Sequence
 
 import numpy as np
@@ -44,34 +52,62 @@ class RocRoboServeClient:
         container: str | None = None,
         *,
         serve_argv: Sequence[str] | None = None,
-        timeout_s: float = 120.0,
+        timeout_s: float | None = None,
     ) -> None:
         self._container = container or os.environ.get(
             "ROCROBO_CONTAINER", "rocrobo_dev"
         )
         self._serve_argv = list(serve_argv) if serve_argv else None
+        # Per-request wall-clock budget. The first request after a cold JAX
+        # compilation cache can legitimately take minutes (XLA compile, GPU idle
+        # / CPU-bound); once the on-disk cache is warm every shape is a fast cache
+        # load, so this is a *stuck-serve* guard, not a latency target. Generous by
+        # default; override with ROCROBO_REQUEST_TIMEOUT_S.
+        if timeout_s is None:
+            timeout_s = float(os.environ.get("ROCROBO_REQUEST_TIMEOUT_S", "300"))
         self._timeout_s = timeout_s
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self.available = True  # set False after a hard failure
+
+    def _jax_cache_env(self) -> dict[str, str]:
+        """Env that persists XLA compiled executables to disk.
+
+        The multi-minute first-call JIT is otherwise paid on EVERY fresh serve:
+        the warm serve only amortises within a single process, but each scenario
+        run spawns a new serve, so without an on-disk cache every run recompiles
+        from scratch (the workshop's original slowdown / timeouts). MIN_*=0 caches
+        even quick/small compiles so warm caches are never partial.
+        """
+        workdir = os.environ.get("ROCROBO_WORKDIR", "/rocrobo")
+        cache_dir = os.environ.get("ROCROBO_JAX_CACHE", f"{workdir}/.jax_cache")
+        return {
+            "JAX_COMPILATION_CACHE_DIR": cache_dir,
+            "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+            "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "0",
+        }
 
     def _argv(self) -> list[str]:
         if self._serve_argv is not None:
             return self._serve_argv
         launch = os.environ.get("ROCROBO_LAUNCH", "docker").lower()
         if launch in ("local", "subprocess", "inline"):
+            # All-in-one image: the serve runs as a local subprocess. The wrapper
+            # sets PYTHONPATH / ROCROBO_ASSETS / LD_LIBRARY_PATH and the JAX
+            # compile-cache env, so there is nothing to inject on argv here.
             wrapper = os.environ.get(
                 "ROCROBO_SERVE_WRAPPER", "/usr/local/bin/rocrobo-serve-local"
             )
             return [wrapper]
-        # rocRobo (RocRobSim repo) is mounted at /rocrobsim; the package lives under
-        # /rocrobsim/rocRobo/core and resolves its sphere assets via ROCROBO_ASSETS
-        # (NOT CWD). Keep CWD at /rocrobsim top level — do NOT cd into
-        # /rocrobsim/pyroki/examples, which holds a stray ``rocrobo.py`` shim that
+        # rocRobo is mounted at /rocrobo; the package lives under
+        # /rocrobo/rocRobo/core and resolves its sphere assets via ROCROBO_ASSETS
+        # (NOT CWD). Keep CWD at /rocrobo top level — do NOT cd into
+        # /rocrobo/pyroki/examples, which holds a stray ``rocrobo.py`` shim that
         # shadows the package under ``python -m`` and breaks ``rocrobo.serve``.
-        workdir = os.environ.get("ROCROBO_WORKDIR", "/rocrobsim")
-        pythonpath = os.environ.get("ROCROBO_PYTHONPATH", "/rocrobsim/rocRobo/core")
-        assets = os.environ.get("ROCROBO_ASSETS", "/rocrobsim/pyroki/examples/assets")
+        workdir = os.environ.get("ROCROBO_WORKDIR", "/rocrobo")
+        pythonpath = os.environ.get("ROCROBO_PYTHONPATH", "/rocrobo/rocRobo/core")
+        assets = os.environ.get("ROCROBO_ASSETS", "/rocrobo/pyroki/examples/assets")
+        cache = self._jax_cache_env()
         return [
             "docker",
             "exec",
@@ -82,6 +118,12 @@ class RocRoboServeClient:
             f"PYTHONPATH={pythonpath}",
             "-e",
             f"ROCROBO_ASSETS={assets}",
+            "-e",
+            f"JAX_COMPILATION_CACHE_DIR={cache['JAX_COMPILATION_CACHE_DIR']}",
+            "-e",
+            "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0",
+            "-e",
+            "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0",
             self._container,
             "python",
             "-u",
@@ -89,6 +131,21 @@ class RocRoboServeClient:
             "rocrobo.serve",
             "--serve",
         ]
+
+    def _popen_env(self) -> dict[str, str] | None:
+        """Environment for the local subprocess launch (belt-and-suspenders).
+
+        For ``docker exec`` the JAX cache env is injected via ``-e`` on argv, so
+        the parent env is irrelevant. For the local wrapper we also seed the JAX
+        cache env into the child environment here, so the persistent cache works
+        even if the wrapper script is customised or replaced.
+        """
+        launch = os.environ.get("ROCROBO_LAUNCH", "docker").lower()
+        if launch not in ("local", "subprocess", "inline"):
+            return None
+        env = dict(os.environ)
+        env.update(self._jax_cache_env())
+        return env
 
     def _ensure_started(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
@@ -99,61 +156,64 @@ class RocRoboServeClient:
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
+            env=self._popen_env(),
         )
-        self._wait_ready()
 
-    def _wait_ready(self) -> None:
-        assert self._proc is not None and self._proc.stderr is not None
-        deadline = time.time() + self._timeout_s
-        while time.time() < deadline:
-            if self._proc.poll() is not None:
-                err = self._proc.stderr.read()
-                raise RuntimeError(
-                    f"rocrobo serve exited during startup: {err[:500]}"
-                )
-            line = self._proc.stderr.readline()
-            if "rocrobo.serve ready" in line:
-                return
-        raise RuntimeError("rocrobo serve ready timeout")
-
-    def _read_json_response(self) -> dict:
-        assert self._proc is not None and self._proc.stdout is not None
-        deadline = time.time() + self._timeout_s
-        while time.time() < deadline:
-            line = self._proc.stdout.readline()
-            if not line:
-                if self._proc.poll() is not None:
-                    break
-                continue
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped[0] in "{[":
-                return json.loads(stripped)
-            logger.debug("[rocrobo] skipping non-json stdout: %s", stripped[:120])
-        self.available = False
-        raise RuntimeError("rocrobo serve closed (no json response)")
+    def _kill(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            self._proc = None
 
     def request(self, payload: dict) -> dict:
-        """Send one JSON request line, return the parsed JSON response line."""
+        """Send one JSON request line, return the parsed JSON response line.
+
+        Bounded by ``self._timeout_s``: a serve that does not answer within the
+        budget is treated as stuck — we tear it down and mark the client
+        unavailable so the caller degrades to the Genesis fallback instead of
+        blocking the whole rollout forever (the readline below is an unbounded
+        blocking read otherwise). The serve is single-request/response over JSONL,
+        so we cannot safely reuse a process whose in-flight response we abandoned;
+        ``available=False`` keeps the rest of the run on the fallback path.
+        """
         if not self.available:
             raise RuntimeError("rocrobo serve marked unavailable")
         with self._lock:
             self._ensure_started()
-            assert self._proc is not None and self._proc.stdin is not None
+            assert self._proc is not None and self._proc.stdin and self._proc.stdout
             try:
                 self._proc.stdin.write(json.dumps(payload) + "\n")
                 self._proc.stdin.flush()
-                return self._read_json_response()
             except (BrokenPipeError, OSError) as exc:
                 self.available = False
+                self._kill()
                 raise RuntimeError(f"rocrobo serve io error: {exc}") from exc
-            except json.JSONDecodeError as exc:
+            ready, _, _ = select.select(
+                [self._proc.stdout], [], [], self._timeout_s
+            )
+            if not ready:
                 self.available = False
-                raise RuntimeError(f"rocrobo serve bad json: {exc}") from exc
+                self._kill()
+                raise RuntimeError(
+                    f"rocrobo serve timeout after {self._timeout_s:.0f}s "
+                    f"(op={payload.get('op')})"
+                )
+            try:
+                line = self._proc.stdout.readline()
+            except (BrokenPipeError, OSError) as exc:
+                self.available = False
+                self._kill()
+                raise RuntimeError(f"rocrobo serve io error: {exc}") from exc
+            if not line:
+                self.available = False
+                self._kill()
+                raise RuntimeError("rocrobo serve closed (empty response)")
+            return json.loads(line)
 
 
 _CLIENT_SINGLETON: RocRoboServeClient | None = None

@@ -96,8 +96,16 @@ ENV PYTHONPATH=/workspace/GraspGen:/workspace/robotsmith \
     ROCROBO_PYTHONPATH=/rocrobo/rocRobo/core \
     ROCROBO_ASSETS=/rocrobo/pyroki/examples/assets \
     ROCROBO_PYTHON=/usr/bin/python3.12 \
+    ROCROBO_JAX_CACHE=/rocrobo/.jax_cache \
+    JAX_COMPILATION_CACHE_DIR=/rocrobo/.jax_cache \
+    JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 \
+    JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0 \
     XLA_PYTHON_CLIENT_PREALLOCATE=false \
     AMD_COMGR_NAMESPACE=1
+
+# Writable on-disk XLA compile cache dir (persists across serve spawns within a
+# container run); the rocRobo serve subprocess amortises its JIT here.
+RUN mkdir -p /rocrobo/.jax_cache
 
 EXPOSE 8888
 
